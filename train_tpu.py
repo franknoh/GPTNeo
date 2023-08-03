@@ -1,81 +1,12 @@
 import torch
 import wandb
-import pandas as pd
 from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from sklearn.metrics import accuracy_score
-from transformers import (GPT2Config,
-                          get_linear_schedule_with_warmup,
-                          GPT2ForSequenceClassification)
+from gptneo import MhcSeqDataset, Gpt2ClassificationCollator, GPTNeo
+from transformers import get_linear_schedule_with_warmup
 from accelerate import Accelerator
-
-
-class MhcSeqDataset(Dataset):
-    def __init__(self, path):
-        df = pd.read_csv(path, sep='\t')
-        self.alignseq = pd.read_csv('data/mhc.tsv', sep='\t')
-        self.mhc = df['Mhc'].tolist()
-        self.seq = df['Seq'].tolist()
-        self.pred = df['Pred'].tolist()
-        return
-
-    def mhc2seq(self, mhc):
-        seq = self.alignseq[self.alignseq['Mhc'] == mhc]['Seq'].tolist()
-        return seq[0]
-
-    def __len__(self):
-        return len(self.mhc)
-
-    def __getitem__(self, item):
-        return {
-            'mhc': self.mhc2seq(self.mhc[item]),
-            'seq': self.seq[item],
-            'pred': float(self.pred[item])
-        }
-
-
-class Gpt2ClassificationCollator(object):
-    def __init__(self, max_sequence_len):
-        self.vocab = ['<pad>', '<mhc>', '</mhc>', '<seq>', '</seq>', '.', '*', 'L', 'A', 'G', 'V', 'E', 'S', 'I', 'K',
-                      'R', 'D', 'T', 'P', 'N', 'Q', 'F', 'Y', 'M', 'H', 'C', 'W', 'X', 'U', 'B', 'Z', 'O']
-        self.pad_idx = 0
-        self.max_sequence_len = max_sequence_len
-        return
-
-    def __call__(self, sequences):
-        seq = [f"<mhc>{sequence['mhc'].upper()}</mhc><seq>{sequence['seq'].upper()}</seq>" for sequence in sequences]
-        labels = [[1 - sequence['pred'], sequence['pred']] for sequence in sequences]
-        inputs = self.encode(seq)
-        inputs.update({'labels': torch.tensor(labels)})
-        return inputs
-
-    def encode(self, sequence):
-        result = []
-        atten_masks = []
-        for seq in sequence:
-            ids = []
-            while seq:
-                found = False
-                for i in range(len(self.vocab)):
-                    if seq.startswith(self.vocab[i]):
-                        ids.append(i)
-                        seq = seq[len(self.vocab[i]):]
-                        found = True
-                        break
-                if not found:
-                    raise ValueError(f"can't find {seq} in vocab")
-            ids = ids[:self.max_sequence_len]
-            masks = [1]*len(ids)
-            padding_length = self.max_sequence_len - len(ids)
-            masks = masks + ([0] * padding_length)
-            ids = ids + ([self.pad_idx] * padding_length)
-            result.append(ids)
-            atten_masks.append(masks)
-        return {
-            'input_ids': torch.tensor(result),
-            'attention_mask': torch.tensor(atten_masks)
-        }
 
 
 def main(use_wandb=True):
@@ -86,7 +17,7 @@ def main(use_wandb=True):
     epochs = 2
     batch_size = 64
     max_length = 384
-    model_name_or_path = 'models/gptneo_3.pt'
+    model_name_or_path = ''
     n_labels = 2
 
     if use_wandb:
@@ -99,14 +30,21 @@ def main(use_wandb=True):
             "n_labels": n_labels
         })
 
-    model_config = GPT2Config.from_pretrained(pretrained_model_name_or_path='gpt2', num_labels=n_labels)
-    model_config.vocab_size = 32
-    model = GPT2ForSequenceClassification.from_pretrained(pretrained_model_name_or_path=model_name_or_path,
-                                                          config=model_config, ignore_mismatched_sizes=True)
+    model = GPTNeo(config={
+        'vocab_size': 32,
+        'block_size': 384,
+        'n_embd': 256,
+        'n_layer': 12,
+        'n_head': 4,
+        'bias': True,
+        'dropout': 0.1
+    })
     model.to(device)
-    model.resize_token_embeddings(32)
     model.config.pad_token_id = 0
     model.train()
+
+    if model_name_or_path:
+        model.load_state_dict(torch.load(model_name_or_path))
     if use_wandb:
         wandb.watch(model)
 
@@ -149,7 +87,7 @@ def main(use_wandb=True):
         train_loss.append(avg_epoch_loss)
         acc = accuracy_score(true_labels, predictions_labels)
         train_acc.append(acc)
-        torch.save(model.state_dict(), f'models/gptneo_{epoch+4}.pt')
+        torch.save(model.state_dict(), f'model.pt')
 
 
 if __name__ == '__main__':
